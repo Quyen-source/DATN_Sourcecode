@@ -3,8 +3,8 @@
 #define CAMERA_MODEL_ESP32S3_EYE
 #include "camera_pins.h"
 
-const char *ssid = "ĐO_AN_TOT_NGHIEP";
-const char *password = "61+41hJ3";
+const char *ssid = "Nhap_SSID";
+const char *password = "Nhap_password";
 
 #define CONNECT_WIFI_GPIO 14
 void setupUltrasonic();
