@@ -25,17 +25,18 @@
 #define CAMERA_POWER_PIN 2
 #define CONNECT_WIFI_GPIO 14
 
-#define DISTANCE_THRESHOLD 10
+#define DISTANCE_THRESHOLD 25
 #define SOUND_SPEED 0.0343 
 #define ECHO_TIMEOUT_US 30000
+#define COMMAND_TIMEOUT 5
 
-// Timer control variables
 String valueString = String(0);
 volatile int motorSpeed = 0;
 volatile bool motorState = false;
 esp_timer_handle_t motorTimer;
 volatile bool motorsEnabled = false;
 String currentDirection = "stop";
+volatile unsigned long lastCommandTime = 0;
 
 // Web server streaming constants
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -49,6 +50,7 @@ volatile bool obstacleLeft = false;
 volatile bool obstacleRight = false;
 volatile bool obstacleFront = false;
 volatile bool cameraOn = true; 
+
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <html>
   <head>
@@ -109,8 +111,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       img#photo {
         width: auto;
         max-width: 100%;
-        max-height: 60vh; /* Giới hạn chiều cao để tránh chồng lấn */
-        transform: rotate(90deg); /* Xoay 90 độ */
+        max-height: 60vh;
+        transform: rotate(90deg);
         transform-origin: center;
         object-fit: contain;
         display: block;
@@ -126,10 +128,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         text-align: center;
       }
       .alert-danger {
-        color: #f44336; /* Red for obstacle detected */
+        color: #f44336;
       }
       .alert-success {
-        color: #4CAF50; /* Green for no obstacle */
+        color: #4CAF50;
       }
     </style>
     <script>
@@ -194,7 +196,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         document.getElementById('motorSlider').value = 0;
         setInterval(updateObstacles, 500);
         document.getElementById('cameraToggleButton').className = "button toggle-button-on";
-        updateObstacles(); // Initial obstacle status
+        updateObstacles();
       };
     </script>
   </head>
@@ -241,6 +243,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </body>
 </html>
 )rawliteral";
+
 void IRAM_ATTR motorTimerCallback(void *arg) {
   if (motorSpeed == 0 || !motorsEnabled) {
     digitalWrite(ENABLE_PIN, LOW);
@@ -262,10 +265,12 @@ void IRAM_ATTR motorTimerCallback(void *arg) {
     esp_timer_start_once(motorTimer, onTimeUs);
   }
 }
+
 esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html; charset=UTF-8");
   return httpd_resp_send(req, (const char *)INDEX_HTML, strlen(INDEX_HTML));
 }
+
 esp_err_t stream_handler(httpd_req_t *req) {
   if (!cameraOn) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera is turned off");
@@ -323,14 +328,16 @@ esp_err_t stream_handler(httpd_req_t *req) {
     if (res != ESP_OK) {
       break;
     }
-    if (!cameraOn) { // Check if camera was turned off during streaming
+    if (!cameraOn) {
       break;
     }
   }
   return res;
 }
+
 void stopMotors(const char* reason) {
   Serial.printf("Stopping motors: %s\n", reason);
+  esp_timer_stop(motorTimer);
   digitalWrite(MOTOR_1_PIN_1, LOW);
   digitalWrite(MOTOR_1_PIN_2, LOW);
   digitalWrite(MOTOR_2_PIN_1, LOW);
@@ -338,9 +345,9 @@ void stopMotors(const char* reason) {
   digitalWrite(ENABLE_PIN, LOW);
   motorState = false;
   motorsEnabled = false;
-  esp_timer_stop(motorTimer);
   currentDirection = "stop";
 }
+
 esp_err_t cmd_handler(httpd_req_t *req) {
   char *buf;
   size_t buf_len;
@@ -371,14 +378,16 @@ esp_err_t cmd_handler(httpd_req_t *req) {
   }
 
   currentDirection = String(variable);
+
   if (!strcmp(variable, "stop")) {
     stopMotors("Button released or stop command");
+    lastCommandTime = millis(); // Cập nhật thời gian khi nhả nút
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, NULL, 0);
   }
+
   if (WiFi.status() != WL_CONNECTED) {
     stopMotors("No WiFi connection");
-    //Serial.println("Cannot move: no WiFi connection");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, NULL, 0);
   }
@@ -386,12 +395,12 @@ esp_err_t cmd_handler(httpd_req_t *req) {
   if (obstacleLeft || obstacleRight || obstacleFront) {
     if (!strcmp(variable, "forward")) {
       stopMotors("Obstacle detected");
-      //Serial.println("Cannot move forward: obstacle detected by sensor");
+      lastCommandTime = millis(); // Cập nhật thời gian khi dừng do vật cản
       httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
       return httpd_resp_send(req, NULL, 0);
     }
   }
-  int res = 0;
+
   if (!strcmp(variable, "forward")) {
     Serial.println("Forward");
     motorsEnabled = true;
@@ -421,12 +430,12 @@ esp_err_t cmd_handler(httpd_req_t *req) {
     digitalWrite(MOTOR_2_PIN_1, HIGH);
     digitalWrite(MOTOR_2_PIN_2, LOW);
   } else {
-    res = -1;
+    stopMotors("Invalid command");
+    lastCommandTime = millis(); // Cập nhật thời gian khi lệnh không hợp lệ
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
   }
 
-  if (res) {
-    return httpd_resp_send_500(req);
-  }
   if (motorsEnabled && motorSpeed > 0) {
     esp_timer_stop(motorTimer);
     motorState = false;
@@ -436,7 +445,7 @@ esp_err_t cmd_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, NULL, 0);
 }
-// Handler for speed control
+
 esp_err_t speed_handler(httpd_req_t *req) {
   char *buf;
   size_t buf_len;
@@ -471,6 +480,7 @@ esp_err_t speed_handler(httpd_req_t *req) {
   
   if (motorSpeed == 0) {
     stopMotors("Speed set to zero");
+    lastCommandTime = millis(); // Cập nhật thời gian khi tốc độ bằng 0
   } else if (motorsEnabled) {
     esp_timer_stop(motorTimer);
     motorState = false;
@@ -481,7 +491,7 @@ esp_err_t speed_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, NULL, 0);
 }
-// Handler for obstacle detection status
+
 esp_err_t obstacles_handler(httpd_req_t *req) {
   char json_response[100];
   snprintf(json_response, sizeof(json_response), 
@@ -495,15 +505,15 @@ esp_err_t obstacles_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json_response, strlen(json_response));
 }
 
-// Handler for toggling camera power
 esp_err_t camera_toggle_handler(httpd_req_t *req) {
-  cameraOn = !cameraOn; // Toggle camera state
+  cameraOn = !cameraOn;
   digitalWrite(CAMERA_POWER_PIN, cameraOn ? LOW : HIGH);
   Serial.printf("Camera turned %s\n", cameraOn ? "ON" : "OFF");
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, NULL, 0);
 }
+
 float measureDistance(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(5);
@@ -513,46 +523,49 @@ float measureDistance(int trigPin, int echoPin) {
 
   unsigned long duration = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
   if (duration == 0) {
-    //Serial.printf("No echo received on pin %d\n", echoPin);
     return 1000.0;
   }
   float distance = (duration * SOUND_SPEED) / 2;
   if (distance > 400 || distance < 2) {
-    //Serial.printf("Invalid distance on pin %d: %.1f cm\n", echoPin, distance);
     return 1000.0;
   }
   return distance;
 }
+
 void updateObstacles() {
   float distanceLeft = measureDistance(TRIG_PIN_LEFT, ECHO_PIN_LEFT);
-  vTaskDelay(pdMS_TO_TICKS(10));
+  vTaskDelay(pdMS_TO_TICKS(2));
   float distanceRight = measureDistance(TRIG_PIN_RIGHT, ECHO_PIN_RIGHT);
-  vTaskDelay(pdMS_TO_TICKS(10));
+  vTaskDelay(pdMS_TO_TICKS(2));
   float distanceFront = measureDistance(TRIG_PIN_FRONT, ECHO_PIN_FRONT);
-  vTaskDelay(pdMS_TO_TICKS(5));
+  vTaskDelay(pdMS_TO_TICKS(2));
 
   obstacleLeft = (distanceLeft < DISTANCE_THRESHOLD && distanceLeft > 0);
   obstacleRight = (distanceRight < DISTANCE_THRESHOLD && distanceRight > 0);
   obstacleFront = (distanceFront < DISTANCE_THRESHOLD && distanceFront > 0);
 }
+
 void motorAndSensorTask(void *pvParameters) {
   while (1) {
     updateObstacles();
     if (motorsEnabled && motorSpeed > 0) {
-      // Dừng ngay nếu phát hiện vật cản khi di chuyển tiến
       if ((obstacleLeft || obstacleRight || obstacleFront) && currentDirection == "forward") {
         stopMotors("Obstacle detected");
-        //Serial.println("Stopped: obstacle detected by sensor while moving forward");
+        lastCommandTime = millis(); // Cập nhật thời gian khi dừng do vật cản
       }
-      // Dừng nếu mất kết nối WiFi
       if (WiFi.status() != WL_CONNECTED) {
         stopMotors("WiFi disconnected in motor task");
-        //Serial.println("Stopped: WiFi disconnected in motor task");
+        lastCommandTime = millis(); // Cập nhật thời gian khi mất WiFi
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(5)); // Giảm từ 20ms xuống 10ms để phản ứng nhanh hơn
+    if (currentDirection == "stop" && lastCommandTime > 0 && millis() - lastCommandTime > COMMAND_TIMEOUT) {
+      stopMotors("Command timeout after stop");
+      lastCommandTime = 0; // Reset thời gian sau khi dừng hoàn toàn
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
+
 void setupUltrasonic() {
   pinMode(TRIG_PIN_LEFT, OUTPUT);
   pinMode(ECHO_PIN_LEFT, INPUT);
@@ -587,18 +600,19 @@ void setupMotors() {
   };
   esp_timer_create(&timer_args, &motorTimer);
 }
+
 void setupCameraPower() {
   pinMode(CAMERA_POWER_PIN, OUTPUT);
-  digitalWrite(CAMERA_POWER_PIN, LOW); // Camera starts ON
+  digitalWrite(CAMERA_POWER_PIN, LOW);
   cameraOn = true;
 }
 
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  config.task_priority = 5;  // Độ ưu tiên thấp nhất cho web server và điều khiển động cơ
-  config.stack_size = 8192;  // Giảm stack size vì không xử lý streaming
-  config.max_open_sockets = 2; // Giới hạn 2 client
+  config.task_priority = 10;
+  config.stack_size = 8192;
+  config.max_open_sockets = 2;
 
   httpd_uri_t index_uri = {
     .uri       = "/",
@@ -658,16 +672,26 @@ void startCameraServer() {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
 }
+
 void wifiMonitorTask(void *pvParameters) {
+  const int maxReconnectAttempts = 5;
+  int reconnectAttempts = 0;
   while (1) {
     if (WiFi.status() == WL_CONNECTED) {
       digitalWrite(CONNECT_WIFI_GPIO, HIGH);
+      reconnectAttempts = 0;
+      Serial.println("WiFi connected");
     } else {
       digitalWrite(CONNECT_WIFI_GPIO, LOW);
       stopMotors("WiFi disconnected");
-      //Serial.println("WiFi disconnected, attempting to reconnect...");
-      WiFi.reconnect();
+      lastCommandTime = millis();
+      if (reconnectAttempts < maxReconnectAttempts) {
+        Serial.printf("WiFi disconnected, attempting to reconnect (%d/%d)...\n", reconnectAttempts + 1, maxReconnectAttempts);
+        WiFi.reconnect();
+        reconnectAttempts++;
+      } else {
+        Serial.println("Max WiFi reconnect attempts reached, stopping attempts");
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(500));
-  }
 }
